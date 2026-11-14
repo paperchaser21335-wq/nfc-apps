@@ -1,0 +1,832 @@
+name: Build Ready APKs v2
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-apks:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Install SDK, Generate Apps, and Compile APKs
+        run: |
+          set +o pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          mkdir -p "$ANDROID_HOME" "$HOME/.android"
+
+          SDKMANAGER=""
+          for candidate in \
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            $(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null) \
+            $(command -v sdkmanager 2>/dev/null); do
+            if [ -x "$candidate" ]; then
+              SDKMANAGER="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$SDKMANAGER" ]; then
+            curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdline-tools.zip
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools-extract
+            mv /tmp/cmdline-tools-extract/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null 2>&1 || true
+          set -eo pipefail
+
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle-8.7-bin.zip
+          unzip -q /tmp/gradle-8.7-bin.zip -d /tmp/gradle-dist
+          export PATH="/tmp/gradle-dist/gradle-8.7/bin:$PATH"
+
+          mkdir -p workdir/wallet/src/main/java/com/custompay/wallet
+          mkdir -p workdir/wallet/src/main/res/values
+          mkdir -p workdir/wallet/src/main/res/xml
+          mkdir -p workdir/terminal/src/main/java/com/custompay/terminal
+          mkdir -p dist
+
+          printf "sdk.dir=%s\n" "$ANDROID_HOME" > workdir/local.properties
+
+          cat << 'EOF' > workdir/settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "NfcPaymentSuite"
+          include(":wallet", ":terminal")
+          EOF
+
+          cat << 'EOF' > workdir/gradle.properties
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
+          EOF
+
+          cat << 'EOF' > workdir/build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat << 'EOF' > workdir/wallet/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.custompay.wallet"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.custompay.wallet"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              lint {
+                  abortOnError = false
+                  checkReleaseBuilds = false
+              }
+          }
+          EOF
+
+          cat << 'EOF' > workdir/wallet/src/main/res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">NFC Wallet</string>
+              <string name="service_desc">Custom NFC Payment Card Service</string>
+              <string name="aid_group_desc">Custom NFC Payment AID</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > workdir/wallet/src/main/res/xml/apduservice.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/service_desc"
+              android:requireDeviceUnlock="false">
+              <aid-group
+                  android:category="other"
+                  android:description="@string/aid_group_desc">
+                  <aid-filter android:name="F0435553544F4D504159" />
+              </aid-group>
+          </host-apdu-service>
+          EOF
+
+          cat << 'EOF' > workdir/wallet/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.NFC" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-feature android:name="android.hardware.nfc" android:required="false" />
+              <uses-feature android:name="android.hardware.nfc.hce" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+
+                  <activity
+                      android:name=".WalletActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CardEmulationService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_NFC_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.nfc.cardemulation.host_apdu_service"
+                          android:resource="@xml/apduservice" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > workdir/wallet/src/main/java/com/custompay/wallet/SecureCardStore.kt
+          package com.custompay.wallet
+
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import android.util.Base64
+          import org.json.JSONObject
+          import java.security.KeyStore
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+
+          object SecureCardStore {
+              private const val KEY_ALIAS = "WalletHardwareKey"
+              private const val PREFS = "wallet_vault"
+
+              private fun getSecretKey(): SecretKey {
+                  val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                  val existing = ks.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
+                  if (existing != null) return existing.secretKey
+
+                  val kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                  kg.init(
+                      KeyGenParameterSpec.Builder(
+                          KEY_ALIAS,
+                          KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                      )
+                          .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                          .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                          .build()
+                  )
+                  return kg.generateKey()
+              }
+
+              fun saveCard(
+                  context: Context,
+                  accountNumber: String,
+                  expiry: String,
+                  cvv: String,
+                  billingAddress: String
+              ) {
+                  val json = JSONObject().apply {
+                      put("pan", accountNumber.trim().take(19))
+                      put("exp", expiry.trim().take(7))
+                      put("cvv", cvv.trim().take(4))
+                      put("addr", billingAddress.trim().take(80))
+                  }.toString()
+
+                  val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                  cipher.init(Cipher.ENCRYPT_MODE, getSecretKey())
+                  val encrypted = cipher.doFinal(json.toByteArray(Charsets.UTF_8))
+
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                      .putString("iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+                      .putString("data", Base64.encodeToString(encrypted, Base64.NO_WRAP))
+                      .putBoolean("armed", true)
+                      .apply()
+              }
+
+              fun loadCardJson(context: Context): String? {
+                  val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  val ivStr = prefs.getString("iv", null) ?: return null
+                  val dataStr = prefs.getString("data", null) ?: return null
+                  return try {
+                      val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                      val spec = GCMParameterSpec(128, Base64.decode(ivStr, Base64.NO_WRAP))
+                      cipher.init(Cipher.DECRYPT_MODE, getSecretKey(), spec)
+                      val plain = cipher.doFinal(Base64.decode(dataStr, Base64.NO_WRAP))
+                      String(plain, Charsets.UTF_8)
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              fun isArmed(context: Context): Boolean =
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("armed", false)
+
+              fun setArmed(context: Context, armed: Boolean) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                      .putBoolean("armed", armed)
+                      .apply()
+              }
+
+              fun clear(context: Context) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+              }
+
+              fun getSummary(context: Context): String {
+                  val raw = loadCardJson(context) ?: return "No card saved."
+                  return try {
+                      val obj = JSONObject(raw)
+                      val pan = obj.optString("pan", "")
+                      val addr = obj.optString("addr", "")
+                      val state = if (isArmed(context)) "ARMED (Ready to Tap)" else "PAUSED"
+                      "Status: $state\nActive Card: **** ${pan.takeLast(4)}\nBilling: $addr"
+                  } catch (e: Exception) {
+                      "No card saved."
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > workdir/wallet/src/main/java/com/custompay/wallet/CardEmulationService.kt
+          package com.custompay.wallet
+
+          import android.content.Intent
+          import android.nfc.cardemulation.HostApduService
+          import android.os.Bundle
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+
+          class CardEmulationService : HostApduService() {
+              private fun hexToBytes(hex: String): ByteArray =
+                  ByteArray(hex.length / 2) { i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+
+              private val selectAidPrefix = hexToBytes("00A404000AF0435553544F4D504159")
+              private val swOk = hexToBytes("9000")
+              private val swNotFound = hexToBytes("6A82")
+              private val swUnknown = hexToBytes("6F00")
+
+              override fun processCommandApdu(commandApdu: ByteArray?, extras: Bundle?): ByteArray {
+                  if (commandApdu == null || commandApdu.size < selectAidPrefix.size) {
+                      return swUnknown
+                  }
+                  val header = commandApdu.sliceArray(0 until selectAidPrefix.size)
+                  if (!header.contentEquals(selectAidPrefix)) {
+                      return swUnknown
+                  }
+                  if (!SecureCardStore.isArmed(applicationContext)) {
+                      return swNotFound
+                  }
+                  val cardJson = SecureCardStore.loadCardJson(applicationContext) ?: return swNotFound
+                  val payload = cardJson.toByteArray(Charsets.UTF_8)
+
+                  try {
+                      getSystemService(Vibrator::class.java)?.vibrate(
+                          VibrationEffect.createOneShot(120, VibrationEffect.DEFAULT_AMPLITUDE)
+                      )
+                  } catch (_: Exception) {
+                  }
+                  sendBroadcast(Intent("com.custompay.wallet.TAP_SENT").setPackage(packageName))
+                  return payload + swOk
+              }
+
+              override fun onDeactivated(reason: Int) {}
+          }
+          EOF
+
+          cat << 'EOF' > workdir/wallet/src/main/java/com/custompay/wallet/WalletActivity.kt
+          package com.custompay.wallet
+
+          import android.app.Activity
+          import android.content.BroadcastReceiver
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.nfc.NfcAdapter
+          import android.nfc.cardemulation.CardEmulation
+          import android.os.Build
+          import android.os.Bundle
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class WalletActivity : Activity() {
+              private lateinit var statusView: TextView
+
+              private val tapReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      Toast.makeText(this@WalletActivity, "NFC Payment Data Sent!", Toast.LENGTH_SHORT).show()
+                      refreshStatus()
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val density = resources.displayMetrics.density
+                  fun dp(v: Int) = (v * density).toInt()
+
+                  val scroll = ScrollView(this).apply { setBackgroundColor(Color.WHITE) }
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(20), dp(20), dp(20))
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "NFC Card Wallet"
+                      textSize = 24f
+                      setTypeface(null, Typeface.BOLD)
+                      setTextColor(Color.BLACK)
+                  }
+
+                  statusView = TextView(this).apply {
+                      textSize = 15f
+                      setTextColor(Color.DKGRAY)
+                      setPadding(dp(12), dp(12), dp(12), dp(12))
+                      setBackgroundColor(Color.parseColor("#F1F5F9"))
+                  }
+
+                  val panInput = EditText(this).apply {
+                      hint = "Account / Card Number (Digits)"
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setTextColor(Color.BLACK)
+                  }
+
+                  val expInput = EditText(this).apply {
+                      hint = "Expiration MM/YY (Optional)"
+                      inputType = InputType.TYPE_CLASS_DATETIME
+                      setTextColor(Color.BLACK)
+                  }
+
+                  val cvvInput = EditText(this).apply {
+                      hint = "CVV (Optional)"
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                      setTextColor(Color.BLACK)
+                  }
+
+                  val addrInput = EditText(this).apply {
+                      hint = "Billing Street Address & ZIP"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_POSTAL_ADDRESS
+                      setTextColor(Color.BLACK)
+                  }
+
+                  val saveBtn = Button(this).apply {
+                      text = "Save & Arm Card for NFC Tap"
+                      setOnClickListener {
+                          val pan = panInput.text.toString().filter { it.isDigit() }
+                          val addr = addrInput.text.toString().trim()
+                          if (pan.length < 4 || addr.isEmpty()) {
+                              Toast.makeText(
+                                  this@WalletActivity,
+                                  "Enter at least a 4+ digit account number and billing address.",
+                                  Toast.LENGTH_LONG
+                              ).show()
+                              return@setOnClickListener
+                          }
+                          SecureCardStore.saveCard(
+                              this@WalletActivity,
+                              pan,
+                              expInput.text.toString(),
+                              cvvInput.text.toString(),
+                              addr
+                          )
+                          panInput.text.clear()
+                          expInput.text.clear()
+                          cvvInput.text.clear()
+                          addrInput.text.clear()
+                          refreshStatus()
+                          Toast.makeText(this@WalletActivity, "Card encrypted & armed for NFC!", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  val toggleBtn = Button(this).apply {
+                      text = "Pause / Resume NFC Broadcasting"
+                      setOnClickListener {
+                          val next = !SecureCardStore.isArmed(this@WalletActivity)
+                          SecureCardStore.setArmed(this@WalletActivity, next)
+                          refreshStatus()
+                      }
+                  }
+
+                  val clearBtn = Button(this).apply {
+                      text = "Delete Saved Card"
+                      setOnClickListener {
+                          SecureCardStore.clear(this@WalletActivity)
+                          refreshStatus()
+                      }
+                  }
+
+                  listOf(title, statusView, panInput, expInput, cvvInput, addrInput, saveBtn, toggleBtn, clearBtn).forEach { view ->
+                      val lp = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { bottomMargin = dp(12) }
+                      root.addView(view, lp)
+                  }
+
+                  scroll.addView(root)
+                  setContentView(scroll)
+                  refreshStatus()
+              }
+
+              private fun refreshStatus() {
+                  val nfc = NfcAdapter.getDefaultAdapter(this)
+                  val nfcState = when {
+                      nfc == null -> "NFC Hardware: Not supported on this phone"
+                      !nfc.isEnabled -> "NFC Radio: OFF (Turn on NFC in Android Settings)"
+                      else -> "NFC Radio: ON (Keep screen awake & hold back-to-back with Terminal)"
+                  }
+                  statusView.text = "$nfcState\n\n${SecureCardStore.getSummary(this)}"
+              }
+
+              @Suppress("UnspecifiedRegisterReceiverFlag")
+              override fun onResume() {
+                  super.onResume()
+                  refreshStatus()
+                  try {
+                      val adapter = NfcAdapter.getDefaultAdapter(this)
+                      if (adapter != null && adapter.isEnabled) {
+                          CardEmulation.getInstance(adapter).setPreferredService(
+                              this,
+                              ComponentName(this, CardEmulationService::class.java)
+                          )
+                      }
+                  } catch (_: Exception) {
+                  }
+                  val filter = IntentFilter("com.custompay.wallet.TAP_SENT")
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      registerReceiver(tapReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                  } else {
+                      registerReceiver(tapReceiver, filter)
+                  }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  try {
+                      val adapter = NfcAdapter.getDefaultAdapter(this)
+                      if (adapter != null) {
+                          CardEmulation.getInstance(adapter).unsetPreferredService(this)
+                      }
+                  } catch (_: Exception) {
+                  }
+                  try {
+                      unregisterReceiver(tapReceiver)
+                  } catch (_: Exception) {
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > workdir/terminal/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.custompay.terminal"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.custompay.terminal"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              lint {
+                  abortOnError = false
+                  checkReleaseBuilds = false
+              }
+          }
+          EOF
+
+          cat << 'EOF' > workdir/terminal/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.NFC" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-feature android:name="android.hardware.nfc" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="NFC Terminal"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+
+                  <activity
+                      android:name=".TerminalActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > workdir/terminal/src/main/java/com/custompay/terminal/TerminalActivity.kt
+          package com.custompay.terminal
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.nfc.NfcAdapter
+          import android.nfc.Tag
+          import android.nfc.tech.IsoDep
+          import android.os.Bundle
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import org.json.JSONObject
+          import java.io.BufferedReader
+          import java.io.InputStreamReader
+          import java.io.OutputStreamWriter
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class TerminalActivity : Activity() {
+              private var nfcAdapter: NfcAdapter? = null
+              private lateinit var logView: TextView
+              private lateinit var armBtn: Button
+              private lateinit var amountInput: EditText
+              private lateinit var webhookInput: EditText
+
+              @Volatile private var readerArmed = false
+              @Volatile private var activeAmount = "15.00"
+              @Volatile private var activeWebhook = ""
+
+              private fun hexToBytes(hex: String): ByteArray =
+                  ByteArray(hex.length / 2) { i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+
+              private val selectApdu = hexToBytes("00A404000AF0435553544F4D50415900")
+
+              private val readerCallback = NfcAdapter.ReaderCallback { tag: Tag ->
+                  if (!readerArmed) return@ReaderCallback
+                  handleTag(tag)
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  nfcAdapter = NfcAdapter.getDefaultAdapter(this)
+                  val density = resources.displayMetrics.density
+                  fun dp(v: Int) = (v * density).toInt()
+
+                  val scroll = ScrollView(this).apply { setBackgroundColor(Color.WHITE) }
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(20), dp(20), dp(20))
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "NFC Payment Terminal"
+                      textSize = 24f
+                      setTypeface(null, Typeface.BOLD)
+                      setTextColor(Color.BLACK)
+                  }
+
+                  amountInput = EditText(this).apply {
+                      hint = "Charge Amount USD (e.g. 15.00)"
+                      setText("15.00")
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                      setTextColor(Color.BLACK)
+                  }
+
+                  webhookInput = EditText(this).apply {
+                      hint = "Optional Payment Webhook URL (Blank = Local POS Approval)"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+                      setTextColor(Color.BLACK)
+                  }
+
+                  armBtn = Button(this).apply {
+                      text = "Charge: Tap Customer Phone"
+                      setOnClickListener {
+                          if (readerArmed) {
+                              stopReader("Terminal idle.")
+                          } else {
+                              startReader()
+                          }
+                      }
+                  }
+
+                  logView = TextView(this).apply {
+                      text = "Enter an amount and tap 'Charge' to activate NFC reader."
+                      textSize = 15f
+                      setTextColor(Color.DKGRAY)
+                      setPadding(dp(14), dp(14), dp(14), dp(14))
+                      setBackgroundColor(Color.parseColor("#F1F5F9"))
+                  }
+
+                  listOf(title, amountInput, webhookInput, armBtn, logView).forEach { view ->
+                      val lp = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { bottomMargin = dp(12) }
+                      root.addView(view, lp)
+                  }
+
+                  scroll.addView(root)
+                  setContentView(scroll)
+              }
+
+              private fun startReader() {
+                  val adapter = nfcAdapter
+                  if (adapter == null || !adapter.isEnabled) {
+                      logView.text = "Turn ON NFC in Android Settings on this Terminal phone first."
+                      return
+                  }
+                  activeAmount = amountInput.text.toString().trim().ifEmpty { "1.00" }
+                  activeWebhook = webhookInput.text.toString().trim()
+                  readerArmed = true
+                  armBtn.text = "Cancel NFC Charge"
+                  logView.text = "WAITING FOR TAP...\nAmount: USD $activeAmount\nHold unlocked Wallet phone back-to-back."
+
+                  adapter.enableReaderMode(
+                      this,
+                      readerCallback,
+                      NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
+                      null
+                  )
+              }
+
+              private fun stopReader(message: String? = null) {
+                  readerArmed = false
+                  runOnUiThread {
+                      try {
+                          nfcAdapter?.disableReaderMode(this)
+                      } catch (_: Exception) {
+                      }
+                      armBtn.text = "Charge: Tap Customer Phone"
+                      if (message != null) logView.text = message
+                  }
+              }
+
+              private fun handleTag(tag: Tag) {
+                  val isoDep = IsoDep.get(tag) ?: run {
+                      postLog("Unsupported NFC device.")
+                      return
+                  }
+                  try {
+                      isoDep.connect()
+                      isoDep.timeout = 5000
+                      val response = isoDep.transceive(selectApdu)
+                      isoDep.close()
+
+                      if (response.size < 2) {
+                          postLog("Incomplete NFC read. Hold phones steady together.")
+                          return
+                      }
+                      val sw1 = response[response.size - 2].toInt() and 0xFF
+                      val sw2 = response[response.size - 1].toInt() and 0xFF
+                      if (sw1 != 0x90 || sw2 != 0x00) {
+                          postLog("DECLINED (Code %02X%02X): No armed card on Wallet phone.".format(sw1, sw2))
+                          return
+                      }
+
+                      val card = JSONObject(String(response, 0, response.size - 2, Charsets.UTF_8))
+                      try {
+                          getSystemService(Vibrator::class.java)?.vibrate(
+                              VibrationEffect.createOneShot(180, VibrationEffect.DEFAULT_AMPLITUDE)
+                          )
+                      } catch (_: Exception) {
+                      }
+                      processPayment(card)
+                  } catch (e: Exception) {
+                      postLog("NFC Read Error: ${e.message ?: "Hold phones steady."}")
+                  }
+              }
+
+              private fun processPayment(card: JSONObject) {
+                  val pan = card.optString("pan", "")
+                  val exp = card.optString("exp", "")
+                  val cvv = card.optString("cvv", "")
+                  val addr = card.optString("addr", "")
+                  val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+
+                  if (activeWebhook.isEmpty()) {
+                      val receipt = "APPROVED (LOCAL POS)\n" +
+                          "Amount: USD $activeAmount\n" +
+                          "Card: **** ${pan.takeLast(4)}\n" +
+                          "Billing: $addr\n" +
+                          "Time: $stamp"
+                      stopReader(receipt)
+                      return
+                  }
+
+                  postLog("Card read (**** ${pan.takeLast(4)}). Contacting payment gateway...")
+                  try {
+                      val payload = JSONObject().apply {
+                          put("amount", activeAmount)
+                          put("accountNumber", pan)
+                          put("exp", exp)
+                          put("cvv", cvv)
+                          put("billingAddress", addr)
+                          put("timestamp", stamp)
+                      }.toString()
+
+                      val conn = (URL(activeWebhook).openConnection() as HttpURLConnection).apply {
+                          requestMethod = "POST"
+                          connectTimeout = 10000
+                          readTimeout = 10000
+                          doOutput = true
+                          setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                      }
+                      OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload) }
+
+                      val code = conn.responseCode
+                      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                      val body = stream?.let {
+                          BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { r -> r.readText() }
+                      } ?: ""
+
+                      val verdict = if (code in 200..299) "APPROVED (GATEWAY $code)" else "DECLINED (HTTP $code)"
+                      val receipt = "$verdict\nAmount: USD $activeAmount\nCard: **** ${pan.takeLast(4)}\nBilling: $addr\nGateway Response: ${body.take(200)}"
+                      stopReader(receipt)
+                  } catch (e: Exception) {
+                      stopReader("GATEWAY ERROR: ${e.message}")
+                  }
+              }
+
+              private fun postLog(msg: String) {
+                  runOnUiThread { logView.text = msg }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  if (readerArmed) stopReader()
+              }
+          }
+          EOF
+
+          gradle -p workdir assembleDebug --no-daemon --stacktrace
+          cp workdir/wallet/build/outputs/apk/debug/wallet-debug.apk dist/NfcWallet.apk
+          cp workdir/terminal/build/outputs/apk/debug/terminal-debug.apk dist/NfcTerminal.apk
+          ls -lh dist/*.apk
+
+      - name: Upload Ready-to-Install APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: NfcPayment-APKs
+          path: dist/*.apk
